@@ -34,3 +34,4 @@ python-dotenv>=1.0,<2.0   # จัดการ environment variables
 
 # --- LLM / Chatbot ---
 openai>=3.0,<4.0          # OpenAI-compatible client (ใช้คุยกับ SGLang บน DGX Spark)
+streamlit>=1.64,<2.0      # เว็บแอปสำหรับ chatbot (app.py)

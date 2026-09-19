@@ -146,6 +146,34 @@ python chatbot.py
 | `/save` | แสดงที่อยู่ไฟล์ log ของ session นี้ |
 | `/exit`, `/quit` | ออกจากโปรแกรม |
 
+### รันเว็บแอป (Streamlit)
+
+```bash
+streamlit run app.py
+```
+
+แล้วเปิดเบราว์เซอร์ที่ <http://localhost:8501>
+
+เว็บแอปใช้ LLM และค่าตั้งชุดเดียวกับ CLI (ไฟล์ `.env`) และมีฟีเจอร์เทียบเท่า:
+
+- ตอบแบบ streaming ทีละคำในบับเบิลแชท
+- จำบริบทการสนทนา และตัดประวัติส่วนเก่าสุดอัตโนมัติเมื่อยาวเกินกำหนด
+- **Sidebar** แสดงการเชื่อมต่อ, สถิติ session (TTFT เฉลี่ย, ความเร็ว token/วินาที, token รวม, % ของ context ที่ใช้ไป)
+- ปุ่ม **ล้างบทสนทนา**, **ดาวน์โหลดบทสนทนา** (ไฟล์ `.md`), และ **โหลดค่าตั้งจาก .env ใหม่**
+- เปิดหลายแท็บพร้อมกันได้ ประวัติแยกกันไม่ปนกัน
+
+> ถ้าอยากให้เครื่องอื่นใน Tailnet เข้าใช้ได้ด้วย:
+> `streamlit run app.py --server.address 0.0.0.0`
+> (ระวัง: Streamlit ไม่มีระบบ login ในตัว ใครเข้าได้ก็ใช้ LLM ของคุณได้)
+
+**ไฟล์ที่เกี่ยวข้อง**
+
+| ไฟล์ | หน้าที่ |
+|---|---|
+| `app.py` | ส่วนติดต่อผู้ใช้ของเว็บ |
+| `chatbot.py` | ส่วนติดต่อผู้ใช้ของ CLI |
+| `llm_core.py` | logic ที่ใช้ร่วมกันทั้งสองแบบ (config, context, การเรียก LLM, error, สถิติ) |
+
 ---
 
 ## โครงสร้างโปรเจกต์
@@ -155,9 +183,11 @@ test/
 ├── .env.example          # เทมเพลต environment variables (commit ได้)
 ├── .gitignore            # ไฟล์/โฟลเดอร์ที่ไม่ต้อง commit
 ├── requirements.txt      # รายการ dependencies พร้อมเวอร์ชัน
+├── llm_core.py           # logic ที่ CLI และเว็บใช้ร่วมกัน
+├── chatbot.py            # CLI chatbot คุยกับ LLM บน DGX Spark
+├── app.py                # เว็บแอป (Streamlit) ของ chatbot เดียวกัน
 ├── game.py               # เกมทายเลข (ตัวอย่างการรับ input)
 ├── test.py               # ทดสอบอ่านค่าจาก .env
-├── chatbot.py            # CLI chatbot คุยกับ LLM บน DGX Spark
 └── logs/                 # ประวัติการสนทนา (ไม่ถูก commit)
 ```
 
@@ -176,6 +206,7 @@ test/
 | Machine Learning | `scikit-learn` |
 | Notebook | `jupyterlab`, `notebook`, `ipykernel`, `ipywidgets` |
 | LLM API | `openai` (ใช้คุยกับ SGLang ซึ่งเป็น OpenAI-compatible) |
+| Web UI | `streamlit` (เว็บแอปใน `app.py`) |
 | อื่น ๆ | `tqdm`, `python-dotenv` |
 
 ---
@@ -206,3 +237,13 @@ git rm --cached <ชื่อไฟล์>
   ```
   !data/sample.csv
   ```
+
+### เรื่องที่ควรรู้เกี่ยวกับโมเดล
+
+- **ถ้าภาษาไทยเพี้ยน** (สระ/วรรณยุกต์หาย หรือตัวอักษรสลับกัน) สาเหตุคือ `LLM_TEMPERATURE` สูงเกินไป
+  ให้ลดลงเหลือ `0.2`–`0.3` — ค่าเริ่มต้นในไฟล์นี้ตั้งไว้ `0.3` แล้ว
+- **`qwen3.8-27b-sglang` เป็น reasoning model** — ถ้าไม่ปิดโหมดคิด โมเดลอาจใช้ token หมดไปกับ
+  `reasoning_content` จนไม่เหลือคำตอบให้ผู้ใช้ ตั้ง `LLM_DISABLE_THINKING=true` (ค่าเริ่มต้น) เพื่อปิด
+  หรือถ้าอยากดูกระบวนการคิด ให้ตั้ง `LLM_DISABLE_THINKING=false` และ `LLM_SHOW_REASONING=true`
+- **ถ้าอยากให้จำบทสนทนายาวขึ้น** — โมเดลนี้รองรับ context 262,144 token แต่ `LLM_MAX_HISTORY_MESSAGES`
+  ตั้งไว้แค่ 20 ข้อความ เพิ่มได้อีกมาก (ระวังหน่วยความจำของ DGX Spark ด้วย)
