@@ -18,6 +18,7 @@ CLI Chatbot — คุยกับ LLM บน DGX Spark (SGLang)
 import os
 import sys
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -151,7 +152,8 @@ ENV_EXAMPLE_FILE = ".env.example"
 COMMANDS = {
     "/help": "แสดงคำสั่งทั้งหมด",
     "/reset": "ล้างประวัติการสนทนา (context)",
-    "/history": "แสดงจำนวนข้อความและสถิติ token",
+    "/history": "แสดงจำนวนข้อความใน context",
+    "/stats": "แสดงสถิติประสิทธิภาพ (เวลา, token, context)",
     "/model": "แสดง model และ endpoint ที่กำลังใช้",
     "/save": "แสดงที่อยู่ไฟล์ log ของ session นี้",
     "/exit": "ออกจากโปรแกรม",
@@ -363,12 +365,51 @@ class TranscriptLogger:
 
 
 # ============================================
-# TOKEN COUNTING
+# SESSION METRICS
 # ============================================
 
 
-class TokenCounter:
-    """นับ token ที่ใช้ไปทั้ง session"""
+class TurnTiming:
+    """เก็บเวลาแต่ละช่วงของหนึ่งเทิร์น เพื่อดูว่า DGX ทำงานเร็วแค่ไหน"""
+
+    def __init__(self):
+        self.started = time.monotonic()
+        self.first_token = None
+        self.finished = None
+
+    def mark_first_token(self):
+        """เรียกเมื่อได้อะไรจากโมเดลเป็นชิ้นแรก ใช้คำนวณ time-to-first-token"""
+        if self.first_token is None:
+            self.first_token = time.monotonic()
+
+    def finish(self):
+        """ปิดการจับเวลา เรียกซ้ำได้แต่จะใช้ค่าแรก"""
+        if self.finished is None:
+            self.finished = time.monotonic()
+
+    @property
+    def ttft(self):
+        """เวลาที่รอจนได้ token แรก (วินาที) — None ถ้าไม่ได้อะไรเลย"""
+        if self.first_token is None:
+            return None
+        return self.first_token - self.started
+
+    @property
+    def elapsed(self):
+        """เวลารวมของเทิร์นนี้ (วินาที)"""
+        end = self.finished if self.finished is not None else time.monotonic()
+        return end - self.started
+
+    @property
+    def gen_time(self):
+        """เวลาที่ใช้สร้างคำตอบหลังได้ token แรก (วินาที)"""
+        if self.first_token is None:
+            return 0.0
+        return self.elapsed - self.ttft
+
+
+class SessionMetrics:
+    """เก็บสถิติทั้ง session — ทั้งจำนวน token และเวลา เพื่อวัดประสิทธิภาพของ DGX"""
 
     def __init__(self):
         self.prompt_tokens = 0
@@ -378,6 +419,17 @@ class TokenCounter:
         self.requests_failed = 0
         self.has_usage = False
 
+        # ข้อมูลของคำขอล่าสุด ใช้ดูว่า context ใกล้เต็มหน้าต่างของโมเดลหรือยัง
+        self.last_prompt_tokens = None
+
+        # สถิติด้านเวลา (วินาที)
+        self.timed_turns = 0
+        self.ttft_total = 0.0
+        self.ttft_min = None
+        self.ttft_max = None
+        self.elapsed_total = 0.0
+        self.gen_time_total = 0.0
+
     def add_usage(self, usage):
         """สะสมค่าจาก usage ที่ server ส่งกลับ (เป็น None ได้ถ้า server ไม่ส่งมา)"""
         if usage is None:
@@ -386,25 +438,118 @@ class TokenCounter:
         self.prompt_tokens += usage.prompt_tokens or 0
         self.completion_tokens += usage.completion_tokens or 0
         self.total_tokens += usage.total_tokens or 0
+        self.last_prompt_tokens = usage.prompt_tokens
 
-    def describe_last(self, usage):
-        """ข้อความสรุป token ของคำตอบล่าสุด"""
+    def add_timing(self, timing):
+        """สะสมเวลาของเทิร์นที่สำเร็จ เพื่อคำนวณค่าเฉลี่ยทั้ง session"""
+        self.timed_turns += 1
+        self.elapsed_total += timing.elapsed
+        self.gen_time_total += timing.gen_time
+
+        if timing.ttft is not None:
+            self.ttft_total += timing.ttft
+            self.ttft_min = (
+                timing.ttft if self.ttft_min is None else min(self.ttft_min, timing.ttft)
+            )
+            self.ttft_max = (
+                timing.ttft if self.ttft_max is None else max(self.ttft_max, timing.ttft)
+            )
+
+    def average_ttft(self):
+        """เวลาเฉลี่ยที่รอจนได้ token แรก (วินาที)"""
+        if not self.timed_turns or not self.ttft_total:
+            return None
+        return self.ttft_total / self.timed_turns
+
+    def average_elapsed(self):
+        """เวลาเฉลี่ยต่อเทิร์น (วินาที)"""
+        if not self.timed_turns:
+            return None
+        return self.elapsed_total / self.timed_turns
+
+    def tokens_per_second(self):
+        """ความเร็วในการสร้างคำตอบเฉลี่ยทั้ง session"""
+        if self.gen_time_total <= 0 or not self.has_usage:
+            return None
+        return self.completion_tokens / self.gen_time_total
+
+    def describe_turn(self, usage, timing, max_context):
+        """
+        สรุปผลของเทิร์นล่าสุดเป็นรายการบรรทัด
+
+        max_context คือความจุสูงสุดของโมเดล (token) ใส่ None ได้ถ้าไม่ทราบ
+        """
+        lines = []
+
+        # --- เวลา ---
+        if timing.ttft is None:
+            lines.append(f"⏱ ใช้เวลา {timing.elapsed:.2f}s (ไม่ได้ token ใด ๆ)")
+        else:
+            text = f"⏱ {timing.ttft:.2f}s ถึง token แรก · {timing.elapsed:.2f}s รวม"
+            if usage is not None and timing.gen_time > 0:
+                text += f" · {usage.completion_tokens / timing.gen_time:.1f} tok/s"
+            lines.append(text)
+
+        # --- token และ context ---
         if usage is None:
-            return "server ไม่ได้ส่งข้อมูล token มา"
-        return (
-            f"token: {usage.prompt_tokens} prompt + {usage.completion_tokens} completion "
-            f"= {usage.total_tokens}"
+            lines.append("📊 server ไม่ได้ส่งข้อมูล token มา")
+        else:
+            text = (
+                f"token {usage.prompt_tokens} prompt + {usage.completion_tokens} completion "
+                f"= {usage.total_tokens}"
+            )
+            if max_context:
+                percent = usage.prompt_tokens / max_context * 100
+                text += f" · context {usage.prompt_tokens:,}/{max_context:,} ({percent:.2f}%)"
+            lines.append(f"📊 {text}")
+
+        return lines
+
+    def describe_session(self, context, max_context):
+        """สรุปสถิติทั้ง session ใช้ทั้งในคำสั่ง /stats และตอนปิดโปรแกรม"""
+        lines = []
+
+        lines.append(
+            f"จำนวนเทิร์น        : {self.requests_ok + self.requests_failed} "
+            f"(สำเร็จ {self.requests_ok} · ล้มเหลว {self.requests_failed})"
         )
 
-    def describe_total(self):
-        """ข้อความสรุป token สะสมทั้ง session"""
-        if not self.has_usage:
-            return "ยังไม่มีข้อมูล token (server ไม่ได้ส่ง usage มา)"
-        return (
-            f"รวม session: {self.total_tokens} token "
-            f"({self.prompt_tokens} prompt + {self.completion_tokens} completion) | "
-            f"คำขอสำเร็จ {self.requests_ok} · ล้มเหลว {self.requests_failed}"
+        if self.timed_turns:
+            average_ttft = self.average_ttft()
+            if average_ttft is not None:
+                lines.append(
+                    f"TTFT               : เฉลี่ย {average_ttft:.2f}s "
+                    f"(ต่ำสุด {self.ttft_min:.2f}s · สูงสุด {self.ttft_max:.2f}s)"
+                )
+            lines.append(
+                f"เวลาตอบ            : เฉลี่ย {self.average_elapsed():.2f}s "
+                f"(รวม {self.elapsed_total:.2f}s)"
+            )
+            speed = self.tokens_per_second()
+            if speed is not None:
+                lines.append(f"ความเร็ว           : เฉลี่ย {speed:.1f} token/วินาที")
+
+        if self.has_usage:
+            lines.append(
+                f"token รวม          : {self.total_tokens:,} "
+                f"({self.prompt_tokens:,} prompt + {self.completion_tokens:,} completion)"
+            )
+        else:
+            lines.append("token รวม          : ยังไม่มีข้อมูล (server ไม่ได้ส่ง usage มา)")
+
+        stats = context.stats()
+        if max_context and self.last_prompt_tokens is not None:
+            percent = self.last_prompt_tokens / max_context * 100
+            lines.append(
+                f"context ปัจจุบัน    : {self.last_prompt_tokens:,} / {max_context:,} token "
+                f"({percent:.2f}%)"
+            )
+        lines.append(
+            f"ข้อความใน context  : {stats['messages']} / {context.max_messages} "
+            f"(ตัดไปแล้ว {stats['trims']} ครั้ง)"
         )
+
+        return lines
 
     def mark_ok(self):
         self.requests_ok += 1
@@ -496,34 +641,44 @@ def friendly_error_message(exc, config):
 
 class ThinkingNotice:
     """
-    แสดงข้อความ "กำลังคิด..." ถ้าโมเดลใช้เวลานานเกินกำหนด
+    แสดงข้อความ "กำลังคิด..." ถ้าโมเดลเงียบนานเกินกำหนด
 
     ใช้ Timer เพื่อไม่ให้การรอไปบล็อกการอ่าน stream
+    ต้องเรียก stop() ทันทีที่เริ่มได้คำตอบ ไม่งั้นข้อความจะไปโผล่กลางคำตอบ
     """
 
     def __init__(self, delay):
         self.delay = delay
         self.shown = False
+        self._active = False
         self._timer = None
 
     def start(self):
         self.shown = False
+        self._active = True
         self._timer = threading.Timer(self.delay, self._show)
         self._timer.daemon = True
         self._timer.start()
 
+    def _print_notice(self):
+        print(f"⏳ {THINKING_TEXT} ", end="", flush=True)
+
     def _show(self):
-        # ป้องกันการแสดงซ้ำ เพราะทั้ง Timer และตัวเรียกตรง ๆ ใช้เมธอดนี้ร่วมกัน
-        if self.shown:
+        # เรียกโดย Timer — ไม่ทำอะไรถ้าหยุดไปแล้วหรือเคยแสดงไปแล้ว
+        if not self._active or self.shown:
             return
         self.shown = True
-        print(f"⏳ {THINKING_TEXT} ", end="", flush=True)
+        self._print_notice()
 
     def show_now(self):
         """แสดงข้อความแจ้งเตือนทันที ใช้เมื่อรู้ว่าโมเดลกำลังคิดอยู่จริง"""
-        self._show()
+        if self.shown:
+            return
+        self.shown = True
+        self._print_notice()
 
     def stop(self):
+        self._active = False
         if self._timer is not None:
             self._timer.cancel()
             self._timer = None
@@ -540,10 +695,25 @@ class LLMSession:
             timeout=config.request_timeout,
             max_retries=config.max_retries,
         )
+        # ความจุสูงสุดของ context (token) ของ model ที่ใช้อยู่ — เติมค่าตอนตรวจ endpoint
+        self.max_context = None
 
-    def list_models(self):
-        """ขอรายชื่อ model ที่ server ให้บริการ"""
-        return [item.id for item in self.client.models.list().data]
+    def models_info(self):
+        """
+        ขอรายชื่อ model ที่ server ให้บริการ
+
+        คืนค่า dict {ชื่อ model: max_model_len หรือ None}
+        max_model_len ไม่ใช่ฟิลด์มาตรฐานของ SDK จึงต้องอ่านผ่าน model_extra
+        """
+        info = {}
+        for item in self.client.models.list().data:
+            info[item.id] = (item.model_extra or {}).get("max_model_len")
+        return info
+
+    def resolve_max_context(self, info):
+        """จำความจุ context ของ model ที่ใช้อยู่ เพื่อเอาไปแสดงผล"""
+        self.max_context = info.get(self.config.model)
+        return self.max_context
 
     def stream_reply(self, messages):
         """
@@ -613,7 +783,7 @@ def check_endpoint(session, config):
     คืนค่า True ถ้าพร้อมใช้งานเต็มรูปแบบ
     """
     try:
-        available = session.list_models()
+        info = session.models_info()
     except APIError as exc:
         print()
         print(f"⚠️  เชื่อมต่อ {config.base_url} ไม่ได้", file=sys.stderr)
@@ -622,15 +792,24 @@ def check_endpoint(session, config):
         print("    จะลองคุยต่อ แต่ถ้าล้มเหลวให้แก้ LLM_BASE_URL ใน .env", file=sys.stderr)
         return False
 
-    if config.model in available:
-        print(f'✅ เชื่อมต่อสำเร็จ — model "{config.model}" พร้อมใช้งาน')
+    # จำความจุ context ไว้แสดงผลว่าใกล้เต็มหน้าต่างของโมเดลหรือยัง
+    max_context = session.resolve_max_context(info)
+
+    if config.model in info:
+        if max_context:
+            print(
+                f'✅ เชื่อมต่อสำเร็จ — model "{config.model}" '
+                f"(context สูงสุด {max_context:,} token)"
+            )
+        else:
+            print(f'✅ เชื่อมต่อสำเร็จ — model "{config.model}" พร้อมใช้งาน')
         return True
 
     print()
     print(f'⚠️  ไม่พบ model "{config.model}" บน server', file=sys.stderr)
-    if available:
+    if info:
         print("    model ที่ server มี:", file=sys.stderr)
-        for name in available:
+        for name in info:
             print(f"      - {name}", file=sys.stderr)
     else:
         print("    server ไม่ได้แจ้งรายชื่อ model", file=sys.stderr)
@@ -644,7 +823,7 @@ def check_endpoint(session, config):
 # ============================================
 
 
-def handle_command(text, config, context, logger, tokens):
+def handle_command(text, config, session, context, logger, metrics):
     """
     จัดการคำสั่งที่ขึ้นต้นด้วย "/"
 
@@ -666,6 +845,7 @@ def handle_command(text, config, context, logger, tokens):
         print("\nคำสั่งที่ใช้ได้:")
         for name, detail in COMMANDS.items():
             print(f"  {name:<9} {detail}")
+        print("\nหมายเหตุ: สถิติเวลาและ token จะแสดงอัตโนมัติหลังทุกคำตอบ")
 
     elif command == "/reset":
         count = context.reset()
@@ -675,15 +855,21 @@ def handle_command(text, config, context, logger, tokens):
     elif command == "/history":
         stats = context.stats()
         print("\nประวัติการสนทนา:")
-        print(f"  ข้อความใน context  : {stats['messages']} / {config.max_history_messages}")
-        print(f"  จำนวนเทิร์น        : {stats['turns']}")
-        print(f"  ครั้งที่ตัด context : {stats['trims']}")
-        print(f"  {tokens.describe_total()}")
+        print(f"  ข้อความใน context   : {stats['messages']} / {config.max_history_messages}")
+        print(f"  จำนวนเทิร์นใน context: {stats['turns']}")
+        print(f"  ครั้งที่ตัด context  : {stats['trims']}")
+
+    elif command == "/stats":
+        print("\nสถิติการทำงาน (session นี้):")
+        for line in metrics.describe_session(context, session.max_context):
+            print(f"  {line}")
 
     elif command == "/model":
         print("\nการเชื่อมต่อ:")
         print(f"  Endpoint : {config.base_url}")
         print(f"  Model    : {config.model}")
+        if session.max_context:
+            print(f"  Context  : สูงสุด {session.max_context:,} token (อ่านจาก server)")
         print(f"  ค่าตั้ง   : อ่านจาก {ENV_FILE}")
 
     elif command == "/save":
@@ -692,7 +878,7 @@ def handle_command(text, config, context, logger, tokens):
     return "handled"
 
 
-def chat_once(config, session, context, logger, tokens):
+def chat_once(config, session, context, logger, metrics):
     """
     รับข้อความจากผู้ใช้และตอบกลับหนึ่งเทิร์น
 
@@ -708,7 +894,7 @@ def chat_once(config, session, context, logger, tokens):
     if not text:
         return True
 
-    action = handle_command(text, config, context, logger, tokens)
+    action = handle_command(text, config, session, context, logger, metrics)
     if action == "exit":
         return False
     if action == "handled":
@@ -728,6 +914,7 @@ def chat_once(config, session, context, logger, tokens):
     reasoning_started = False
     incomplete = False
     notice = ThinkingNotice(config.thinking_notice_seconds)
+    timing = TurnTiming()
 
     try:
         notice.start()
@@ -739,6 +926,9 @@ def chat_once(config, session, context, logger, tokens):
                 if kind == "finish":
                     finish_reason = value
                     continue
+
+                # ชิ้นแรกที่ได้จากโมเดล คือจุดสิ้นสุดของ time-to-first-token
+                timing.mark_first_token()
 
                 if kind == "reasoning":
                     if not config.show_reasoning:
@@ -755,6 +945,8 @@ def chat_once(config, session, context, logger, tokens):
 
                 if not started:
                     started = True
+                    # ต้องหยุดตัวจับเวลาทันที ไม่งั้นข้อความ "กำลังคิด..." จะไปโผล่กลางคำตอบ
+                    notice.stop()
                     if notice.shown or reasoning_started:
                         # มีข้อความแจ้งเตือนหรือกระบวนการคิดอยู่แล้ว ขึ้นบรรทัดใหม่ก่อนตอบ
                         print()
@@ -763,6 +955,7 @@ def chat_once(config, session, context, logger, tokens):
                 reply_parts.append(value)
         finally:
             notice.stop()
+            timing.finish()
 
         if not started:
             print("ผู้ช่วย: (ไม่ได้รับข้อความตอบกลับ)")
@@ -772,7 +965,7 @@ def chat_once(config, session, context, logger, tokens):
         notice.stop()
         incomplete = True
         print("\n⏹  ยกเลิกการตอบ (กด Ctrl+C)")
-        tokens.mark_failed()
+        metrics.mark_failed()
         logger.log_event("ผู้ใช้ยกเลิกคำตอบกลางทาง")
 
     except APIError as exc:
@@ -781,7 +974,7 @@ def chat_once(config, session, context, logger, tokens):
         print()
         message, level = friendly_error_message(exc, config)
         print(f"❌ {message}", file=sys.stderr)
-        tokens.mark_failed()
+        metrics.mark_failed()
         logger.log_event(f"เกิดข้อผิดพลาด: {type(exc).__name__}")
         if level == "fatal":
             return False
@@ -791,18 +984,21 @@ def chat_once(config, session, context, logger, tokens):
         incomplete = True
         print()
         print(f"❌ เกิดข้อผิดพลาดที่ไม่คาดคิด ({type(exc).__name__}): {exc}", file=sys.stderr)
-        tokens.mark_failed()
+        metrics.mark_failed()
         logger.log_event(f"เกิดข้อผิดพลาด: {type(exc).__name__}")
 
     # ---- เก็บผลลัพธ์ ----
     reply = "".join(reply_parts).strip()
+    timing.finish()
 
     if reply:
         context.add_assistant(reply)
         logger.log_assistant(reply)
-        tokens.mark_ok()
-        tokens.add_usage(usage)
-        print(f"   [{tokens.describe_last(usage)}]")
+        metrics.mark_ok()
+        metrics.add_usage(usage)
+        metrics.add_timing(timing)
+        for line in metrics.describe_turn(usage, timing, session.max_context):
+            print(f"   {line}")
         if finish_reason == "length":
             print("   ⚠️  คำตอบถูกตัดเพราะยาวเกิน LLM_MAX_COMPLETION_TOKENS")
         elif incomplete:
@@ -810,7 +1006,7 @@ def chat_once(config, session, context, logger, tokens):
     else:
         # ไม่มีคำตอบ → ถอนข้อความผู้ใช้ออก เพื่อไม่ให้ context เพี้ยน
         context.drop_last_user_message()
-        print("ℹ️  ไม่มีคำตอบ ประวัติการสนทนาจึงไม่ถูกบันทึก")
+        print(f"ℹ️  ไม่มีคำตอบ ประวัติการสนทนาจึงไม่ถูกบันทึก (ใช้เวลา {timing.elapsed:.2f}s)")
 
     return True
 
@@ -854,7 +1050,7 @@ def main():
 
     context = ConversationContext(config.system_prompt, config.max_history_messages)
     logger = TranscriptLogger(config.log_dir)
-    tokens = TokenCounter()
+    metrics = SessionMetrics()
     session = LLMSession(config)
 
     print_banner(config)
@@ -862,14 +1058,16 @@ def main():
 
     try:
         check_endpoint(session, config)
-        while chat_once(config, session, context, logger, tokens):
+        while chat_once(config, session, context, logger, metrics):
             pass
     except KeyboardInterrupt:
         print()
     finally:
         session.close()
         print("-" * 58)
-        print(tokens.describe_total())
+        print("สรุปการทำงาน:")
+        for line in metrics.describe_session(context, session.max_context):
+            print(f"  {line}")
         print(f"บันทึกประวัติไว้ที่: {logger.path.resolve()}")
         print("=" * 58)
         print("ขอบคุณที่ใช้งานครับ")
