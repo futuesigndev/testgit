@@ -31,3 +31,6 @@ ipywidgets>=8.1,<9.0
 # --- Utility ---
 tqdm>=4.66,<5.0           # Progress bar
 python-dotenv>=1.0,<2.0   # จัดการ environment variables
+
+# --- LLM / Chatbot ---
+openai>=3.0,<4.0          # OpenAI-compatible client (ใช้คุยกับ SGLang บน DGX Spark)
